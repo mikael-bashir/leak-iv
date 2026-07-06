@@ -52,9 +52,15 @@ mcp = FastMCP(
     ),
 )
 
-# How long a single verify may run before we give up (Lean elaboration for a
-# hard proof can be slow; this is the backstop, not the normal path).
+# How long a single (warm) verify may run before we give up (Lean elaboration
+# for a hard proof can be slow; this is the backstop, not the normal path).
 VERIFY_TIMEOUT = 180.0
+# The FIRST compile has to load all of Mathlib into the elaborator. On a small
+# shared CPU (e.g. HF cpu-basic) that cold load can take several minutes, so the
+# one-off warmup gets a much larger ceiling. If this is too small, the warmup
+# times out mid-load, the next verify's didChange restarts the load, and Mathlib
+# never becomes resident — which is exactly what made the daemon look "stuck".
+WARMUP_TIMEOUT = 1200.0
 
 
 class LeanCompilerDaemon:
@@ -146,7 +152,7 @@ class LeanCompilerDaemon:
         return json.loads(body.decode("utf-8"))
 
     # ---- the one public operation -----------------------------------------
-    async def verify_script(self, script: str) -> str:
+    async def verify_script(self, script: str, timeout: float = VERIFY_TIMEOUT) -> str:
         async with self.lock:
             self.verify_count += 1
             n = self.verify_count
@@ -188,11 +194,10 @@ class LeanCompilerDaemon:
                 merged: list | None = None   # accumulated diagnostics for `ver`
                 publishes = 0
                 while True:
-                    if time.time() - t0 > VERIFY_TIMEOUT:
-                        raise TimeoutError(f"verify exceeded {VERIFY_TIMEOUT:.0f}s")
+                    if time.time() - t0 > timeout:
+                        raise TimeoutError(f"verify exceeded {timeout:.0f}s")
 
-                    msg = await asyncio.wait_for(
-                        self._read(), timeout=VERIFY_TIMEOUT)
+                    msg = await asyncio.wait_for(self._read(), timeout=timeout)
 
                     # response to OUR waitForDiagnostics -> done for this version
                     if msg.get("id") == wf_id and "method" not in msg:
@@ -285,16 +290,30 @@ async def verify_full_script(script: str) -> str:
 # =============================================================================
 # BOOT
 # =============================================================================
+async def _warmup():
+    logger.info("⏳ Warmup: cold-loading Mathlib into the elaborator "
+                "(first load can take several minutes on a small CPU)…")
+    try:
+        r = await fast_compiler.verify_script(
+            "theorem warmup : 1 + 1 = 2 := by rfl", timeout=WARMUP_TIMEOUT)
+        logger.info(f"✅ Warmup complete — Mathlib resident. Result: {r}")
+    except Exception as e:
+        logger.error(f"⚠️  Warmup did not finish: {e}")
+
+
 async def main_serve():
     logger.info("=" * 60)
     logger.info("Booting Leak Lean Daemon…")
     logger.info("=" * 60)
     await fast_compiler.boot()
 
-    logger.info("⏳ Warmup: loading Mathlib into elaboration (15–60s on cold boot)…")
-    warm = await fast_compiler.verify_script(
-        "theorem warmup : 1 + 1 = 2 := by rfl")
-    logger.info(f"✅ Warmup complete — Mathlib resident. Result: {warm}")
+    # Warm Mathlib in the BACKGROUND and start serving immediately. Two reasons:
+    #  1. The port opens right away so HF marks the Space healthy (no startup
+    #     kill while a multi-minute cold load runs).
+    #  2. The daemon lock serialises verifies, so the first real request simply
+    #     WAITS behind this warmup instead of firing its own didChange and
+    #     restarting the load — the thrash that kept Mathlib from ever loading.
+    asyncio.create_task(_warmup())
 
     http_app = mcp.sse_app()
     http_app.add_middleware(
