@@ -3,3 +3,5 @@ venv
 /PyPantograph/.lake
 /.lake/
 /PyPantograph
+__pycache__/
+*.pyc
