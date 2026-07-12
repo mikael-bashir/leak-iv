@@ -45,6 +45,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("leak-daemon")
 
+
+class WorkerCrashed(Exception):
+    """Lean's per-file worker aborted (native stack overflow / bug) while the
+    `lake serve` watchdog stayed alive. Recoverable: respawn the file worker."""
+
+
+# stderr markers that mean the file worker hard-aborted its OS process (as
+# opposed to a graceful "(kernel) deep recursion detected" diagnostic, which the
+# worker survives). Seeing any of these lets us fail the in-flight read FAST
+# instead of blocking the whole VERIFY_TIMEOUT for a reply that will never come.
+_CRASH_MARKERS = ("stack overflow", "aborting", "panic", "segmentation fault", "libc++abi")
+# JSON-RPC error codes the Lean watchdog returns when the file worker died:
+#   -32902 workerCrashed, -32900 workerExited. Watchdog is still up → recover.
+_WORKER_DEAD_CODES = (-32902, -32900)
+
 mcp = FastMCP(
     "Leak-Daemon",
     transport_security=TransportSecuritySettings(
@@ -70,6 +85,9 @@ class LeanCompilerDaemon:
         self.process: asyncio.subprocess.Process | None = None
         self.project_dir = os.environ.get("LEAN_PROJECT_PATH", ".")
         self.lock = asyncio.Lock()          # verify calls are serialised
+        # Tripped by the stderr watcher when the file worker prints a native
+        # abort, so the read loop can bail out immediately instead of hanging.
+        self._crash_event = asyncio.Event()
         self.version = 1                    # monotonic LSP document version
         self.request_id = 1000              # monotonic LSP request id
         self.verify_count = 0               # for log correlation
@@ -118,7 +136,14 @@ class LeanCompilerDaemon:
                 line = await self.process.stderr.readline()
                 if not line:
                     break
-                logger.info(f"🛰️  [LSP-STDERR] {line.decode('utf-8', 'replace').rstrip()}")
+                text = line.decode("utf-8", "replace").rstrip()
+                logger.info(f"🛰️  [LSP-STDERR] {text}")
+                low = text.lower()
+                if any(k in low for k in _CRASH_MARKERS):
+                    # The file worker just hard-aborted. Signal the read loop so
+                    # it stops waiting on a reply the dead worker won't send.
+                    self._crash_event.set()
+                    logger.error("💀 [LSP-STDERR] file worker aborted — arming self-heal")
             except Exception:
                 break
 
@@ -151,6 +176,54 @@ class LeanCompilerDaemon:
         body = await self.process.stdout.readexactly(content_length)
         return json.loads(body.decode("utf-8"))
 
+    async def _await_message(self, timeout: float) -> dict:
+        """Read the next LSP message, but bail out FAST (WorkerCrashed) if the
+        file worker aborts mid-read. A dead worker never replies to our pending
+        waitForDiagnostics, so a plain read would block for the full timeout —
+        exactly the 3-minute hang from the 2026-07-12 outage. We race the read
+        against the crash signal the stderr watcher sets on 'Aborting.'."""
+        read_fut = asyncio.ensure_future(self._read())
+        crash_fut = asyncio.ensure_future(self._crash_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {read_fut, crash_fut}, timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED)
+            if read_fut in done:
+                return read_fut.result()          # normal message (or raises EOF/etc.)
+            if crash_fut in done:
+                raise WorkerCrashed("file worker aborted (native stack overflow)")
+            raise TimeoutError(f"verify exceeded {timeout:.0f}s")
+        finally:
+            for f in (read_fut, crash_fut):
+                if not f.done():
+                    f.cancel()
+                try:
+                    await f
+                except BaseException:
+                    pass  # swallow the cancellation / already-handled exception
+
+    async def _recover_worker(self, n: int):
+        """A file worker crashed but the `lake serve` WATCHDOG is usually still
+        alive (that's what returns -32902 workerCrashed). Tear the dead worker
+        down with didClose so the NEXT verify re-opens a fresh one (~Mathlib
+        re-import, ~80s) — far cheaper than a full daemon reboot, and it un-poisons
+        the session so healthy scripts stop failing. If the watchdog itself is
+        gone, force a full reboot on the next call instead."""
+        self._crash_event.clear()
+        if not self.process or self.process.returncode is not None:
+            self.process = None
+            self._is_file_open = False
+            logger.error(f"♻️  [#{n}] watchdog gone — full reboot armed for next call")
+            return
+        try:
+            if self._is_file_open:
+                await self._send("textDocument/didClose",
+                                 {"textDocument": {"uri": self.uri}})
+        except Exception:
+            self.process = None            # watchdog stdin dead → reboot next call
+        self._is_file_open = False
+        logger.info(f"♻️  [#{n}] file-worker respawn armed (didClose sent; next verify re-opens)")
+
     # ---- the one public operation -----------------------------------------
     async def verify_script(self, script: str, timeout: float = VERIFY_TIMEOUT) -> str:
         async with self.lock:
@@ -173,6 +246,9 @@ class LeanCompilerDaemon:
             logger.info(f"🔎 [#{n}] VERIFY  version={ver}  chars={len(script)}")
             logger.info(f"🔎 [#{n}] script: {preview}{'…' if len(script) > 200 else ''}")
 
+            # Fresh crash slate: a set flag left over from a prior worker abort
+            # must not instantly trip this (already recovered) verify.
+            self._crash_event.clear()
             try:
                 if not self._is_file_open:
                     await self._send("textDocument/didOpen", {"textDocument": {
@@ -197,11 +273,16 @@ class LeanCompilerDaemon:
                     if time.time() - t0 > timeout:
                         raise TimeoutError(f"verify exceeded {timeout:.0f}s")
 
-                    msg = await asyncio.wait_for(self._read(), timeout=timeout)
+                    msg = await self._await_message(timeout)
 
                     # response to OUR waitForDiagnostics -> done for this version
                     if msg.get("id") == wf_id and "method" not in msg:
                         if "error" in msg:
+                            err = msg["error"] or {}
+                            if err.get("code") in _WORKER_DEAD_CODES:
+                                # The watchdog told us the file worker crashed —
+                                # recoverable, not a genuine proof failure.
+                                raise WorkerCrashed(f"waitForDiagnostics: {err}")
                             raise RuntimeError(
                                 f"waitForDiagnostics error: {msg['error']}")
                         logger.info(f"🏁 [#{n}] waitForDiagnostics returned "
@@ -250,6 +331,16 @@ class LeanCompilerDaemon:
                     logger.info(f"❌ [#{n}] {lines[-1]}")
                 logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s)")
                 return "❌ Compilation Failed:\n" + "\n".join(lines)
+
+            except WorkerCrashed as e:
+                # The file worker aborted but the daemon is NOT dead: respawn the
+                # worker so the next request works instead of failing forever.
+                logger.error(f"💥 [#{n}] worker crash: {e}")
+                await self._recover_worker(n)
+                return ("❌ Verification Error: the Lean worker crashed (native "
+                        "stack overflow or bug) while checking this script. The "
+                        "daemon has self-healed — retry a different/lighter script. "
+                        f"Detail: {e}")
 
             except Exception as e:
                 logger.error(f"💥 [#{n}] {traceback.format_exc()}")
