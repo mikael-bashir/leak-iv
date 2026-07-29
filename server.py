@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -320,7 +321,23 @@ class LeanCompilerDaemon:
                 elapsed = int((time.time() - t0) * 1000)
                 if not bad:
                     logger.info(f"✅ [#{n}] VERIFIED in {elapsed}ms — no errors/warnings")
-                    return "✅ Compilation Successful! The proof is 100% verified."
+                    # Callers persist "the script that got proved" as the final
+                    # certificate — but they only ever see what THEY sent
+                    # (`script`), not `full_text` (what actually got compiled,
+                    # import injected). If the caller's script had no import, a
+                    # naive caller stores an incomplete artifact that silently
+                    # depended on this daemon's injection to ever have compiled.
+                    # Ending the return with a machine-parseable, escaping-proof
+                    # (base64, no embedded newlines/quotes) marker lets a caller
+                    # recover the EXACT compiled text instead of re-deriving it.
+                    # The leading sentence is unchanged, so any caller matching
+                    # only on "Compilation Successful"/"100% verified" — the
+                    # existing contract — keeps working without modification.
+                    normalized_b64 = base64.b64encode(full_text.encode("utf-8")).decode("ascii")
+                    return (
+                        "✅ Compilation Successful! The proof is 100% verified.\n"
+                        f"[[LEAK_NORMALIZED_SCRIPT_B64:{normalized_b64}]]"
+                    )
 
                 lines = []
                 for d in bad:
@@ -369,6 +386,13 @@ async def verify_full_script(script: str) -> str:
 
     IMPORTANT: "import Mathlib" is injected for you — do not add imports, and
     assume only Mathlib is available.
+
+    On success the return also ends with a machine-parseable marker
+    `[[LEAK_NORMALIZED_SCRIPT_B64:<base64>]]` carrying the EXACT text that was
+    compiled (your script with "import Mathlib" injected if it was missing).
+    A caller that persists "the proof" should decode and store this instead of
+    its own `script` argument, so the saved artifact is self-contained and
+    doesn't silently depend on this daemon's injection to compile standalone.
     """
     try:
         return await fast_compiler.verify_script(script)
