@@ -318,6 +318,26 @@ class LeanCompilerDaemon:
                 # the promise is a hole-free proof, and a warning here is a hole.
                 bad = [d for d in diags if d.get("severity", 1) in (1, 2)]
 
+                # `apply?` / `exact?` / `rw?` / `simp?` report their hits as
+                # severity-3 INFORMATION ("Try this: exact Nat.add_zero n"),
+                # which this filter dropped — so a caller could run apply? and
+                # never read the answer. They are ADVISORY: collected here, they
+                # never touch the pass/fail verdict, and the format deliberately
+                # does NOT match the "Line N (Error|Warning):" grammar callers
+                # parse, so no existing consumer changes behaviour.
+                hints = []
+                for d in diags:
+                    if d.get("severity") != 3:
+                        continue
+                    m = " ".join(str(d.get("message", "")).split())
+                    if not m.lower().startswith("try this"):
+                        continue
+                    ln = d.get("range", {}).get("start", {}).get("line", 0) + 1
+                    hints.append(f"Suggestion @ line {ln}: {m}")
+                hint_block = ("\n[[LEAK_SUGGESTIONS]]\n" + "\n".join(hints)) if hints else ""
+                if hints:
+                    logger.info(f"💡 [#{n}] {len(hints)} tactic suggestion(s) harvested")
+
                 elapsed = int((time.time() - t0) * 1000)
                 if not bad:
                     logger.info(f"✅ [#{n}] VERIFIED in {elapsed}ms — no errors/warnings")
@@ -337,6 +357,7 @@ class LeanCompilerDaemon:
                     return (
                         "✅ Compilation Successful! The proof is 100% verified.\n"
                         f"[[LEAK_NORMALIZED_SCRIPT_B64:{normalized_b64}]]"
+                        f"{hint_block}"
                     )
 
                 lines = []
@@ -347,7 +368,7 @@ class LeanCompilerDaemon:
                     lines.append(f"Line {ln} ({sev}): {m}")
                     logger.info(f"❌ [#{n}] {lines[-1]}")
                 logger.info(f"❌ [#{n}] FAILED in {elapsed}ms — {len(bad)} issue(s)")
-                return "❌ Compilation Failed:\n" + "\n".join(lines)
+                return "❌ Compilation Failed:\n" + "\n".join(lines) + hint_block
 
             except WorkerCrashed as e:
                 # The file worker aborted but the daemon is NOT dead: respawn the
