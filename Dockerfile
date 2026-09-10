@@ -37,8 +37,10 @@ RUN uv python install 3.11
 RUN uv venv --python 3.11 ${HOME}/app/.venv
 ENV PATH="${HOME}/app/.venv/bin:${PATH}"
 
-# Install FastMCP
-RUN uv pip install fastmcp asyncio nest_asyncio
+# Install FastMCP. "mcp<2" pinned: mcp 2.x renamed FastMCP to MCPServer and
+# changed its API, breaking server.py's `from mcp.server.fastmcp import
+# FastMCP` import.
+RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 
 # Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv
 WORKDIR ${HOME}/PyPantograph
