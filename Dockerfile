@@ -42,13 +42,12 @@ ENV PATH="${HOME}/app/.venv/bin:${PATH}"
 # FastMCP` import.
 RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 
-# Clone PyPantograph (WITH submodules) to a separate folder and install it into our venv
-WORKDIR ${HOME}/PyPantograph
-RUN git clone --recurse-submodules https://github.com/stanford-centaur/PyPantograph.git .
-
-RUN cp ${HOME}/app/lean-toolchain ./src/lean-toolchain
-RUN python3 build-pantograph.py
-RUN uv pip install .
+# NOTE: this Dockerfile used to also clone and build PyPantograph here, but
+# server.py drives `lake serve`'s own LSP protocol directly (see its own
+# "no interactive Pantograph" comment) and never imports the pantograph
+# package — that block only existed as unused copy-paste from Leak-II's
+# Dockerfile, and every day it stayed was a toolchain-upgrade risk this
+# service never actually needed to carry. Removed.
 
 # 8. Setup Lean Mathlib Cache
 WORKDIR ${HOME}/app
