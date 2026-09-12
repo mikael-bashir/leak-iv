@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
@@ -71,6 +72,11 @@ mcp = FastMCP(
 # How long a single (warm) verify may run before we give up (Lean elaboration
 # for a hard proof can be slow; this is the backstop, not the normal path).
 VERIFY_TIMEOUT = 180.0
+# What every script compiles against: the Tengoku tree's root. Newline-separated
+# import lines; the first one also replaces a legacy `import Mathlib`.
+TENGOKU_IMPORTS = os.environ.get("TENGOKU_IMPORTS", "import Tengoku").strip()
+# The tree checkout the daemon serves (its own lakefile, its own build cache).
+TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
 # The FIRST compile has to load all of Mathlib into the elaborator. On a small
 # shared CPU (e.g. HF cpu-basic) that cold load can take several minutes, so the
 # one-off warmup gets a much larger ceiling. If this is too small, the warmup
@@ -238,8 +244,13 @@ class LeanCompilerDaemon:
 
             self.version += 1
             ver = self.version
+            # The environment is the Tengoku tree (one self-contained library
+            # seeded from Mathlib); its root import is injected unless the
+            # script already imports from the tree. `import Mathlib` in a
+            # legacy script is rewritten to the tree's root.
+            script = re.sub(r"^[ \t]*import[ \t]+Mathlib[ \t]*$", TENGOKU_IMPORTS.split("\n")[0], script, flags=re.M)
             full_text = (
-                script if "import Mathlib" in script else f"import Mathlib\n\n{script}"
+                script if re.search(r"^[ \t]*import[ \t]+Tengoku\b", script, re.M) else f"{TENGOKU_IMPORTS}\n\n{script}"
             ).strip() + "\n\n"
 
             preview = " ".join(script.strip().split())[:200]
@@ -405,12 +416,15 @@ async def verify_full_script(script: str) -> str:
     and NO warnings (a `sorry`/`admit` is a warning and therefore fails). On any
     problem it returns "❌ Compilation Failed:" followed by each Line/severity/message.
 
-    IMPORTANT: "import Mathlib" is injected for you — do not add imports, and
-    assume only Mathlib is available.
+    IMPORTANT: the Tengoku tree's root import is injected for you — do not add
+    imports (a legacy `import Mathlib` line is rewritten to the tree's root),
+    and assume exactly what the tree contains is available: everything it was
+    seeded with (Mathlib and what Mathlib pulled in) plus every verified
+    addition since (`Tengoku.<Library>.*`).
 
     On success the return also ends with a machine-parseable marker
     `[[LEAK_NORMALIZED_SCRIPT_B64:<base64>]]` carrying the EXACT text that was
-    compiled (your script with "import Mathlib" injected if it was missing).
+    compiled (your script with the tree import injected if it was missing).
     A caller that persists "the proof" should decode and store this instead of
     its own `script` argument, so the saved artifact is self-contained and
     doesn't silently depend on this daemon's injection to compile standalone.
@@ -421,6 +435,55 @@ async def verify_full_script(script: str) -> str:
         err = traceback.format_exc()
         logger.error(f"💥 [TOOL] unexpected error:\n{err}")
         return f"❌ Unexpected server error during verification:\n{err}"
+
+
+async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return -1, f"timed out after {timeout:.0f}s: {' '.join(cmd)}"
+    return proc.returncode, out.decode("utf-8", errors="replace")
+
+
+@mcp.tool()
+async def tengoku_sync() -> str:
+    """
+    Update this verifier's environment to whatever the Tengoku tree currently
+    is: pull the tree, fetch its newest published build cache
+    (`scripts/cache.sh get`), build whatever the cache doesn't cover, then
+    restart the resident `lake serve` so new modules are importable.
+
+    Serialised with verification (no verify runs mid-sync). Returns the tree's
+    new HEAD and what each step did. Idempotent: syncing an already-current
+    tree is a no-op apart from the restart.
+    """
+    async with fast_compiler.lock:
+        steps = []
+        head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+        rc, out = await _run(["git", "pull", "--ff-only", "origin", "main"], TENGOKU_DIR, 300)
+        steps.append(f"git pull: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
+        if rc != 0:
+            return "❌ tengoku_sync: git pull failed\n" + "\n".join(steps) + "\n" + out[-1500:]
+        rc, out = await _run(["scripts/cache.sh", "get"], TENGOKU_DIR, 1800)
+        steps.append(f"cache get: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
+        rc, out = await _run(["lake", "build"], TENGOKU_DIR, 3600)
+        steps.append(f"lake build: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
+        if rc != 0:
+            return "❌ tengoku_sync: the tree does not build here (cache incomplete or stale toolchain?)\n" + "\n".join(steps) + "\n" + out[-2000:]
+        head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+        # Restart the resident elaborator so the refreshed oleans are what
+        # every following verify imports.
+        if fast_compiler.process and fast_compiler.process.returncode is None:
+            fast_compiler.process.kill()
+            await fast_compiler.process.wait()
+        fast_compiler.process = None
+        fast_compiler._is_file_open = False
+    await fast_compiler.boot()
+    asyncio.create_task(_warmup())
+    return f"✅ tengoku_sync: tree {head_before} → {head_after}; elaborator restarted, warming.\n" + "\n".join(steps)
 
 
 # =============================================================================
@@ -460,9 +523,10 @@ async def main_serve():
         expose_headers=["mcp-session-id"],
     )
 
-    logger.info("🌐 Serving MCP (SSE) on 0.0.0.0:7860")
+    port = int(os.environ.get("PORT", "7860"))
+    logger.info(f"🌐 Serving MCP (SSE) on 0.0.0.0:{port}")
     config = uvicorn.Config(
-        http_app, host="0.0.0.0", port=7860,
+        http_app, host="0.0.0.0", port=port,
         proxy_headers=True, forwarded_allow_ips="*",
         log_level="info", loop="asyncio",
     )

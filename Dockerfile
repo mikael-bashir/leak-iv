@@ -49,15 +49,20 @@ RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 # Dockerfile, and every day it stayed was a toolchain-upgrade risk this
 # service never actually needed to carry. Removed.
 
-# 8. Setup Lean Mathlib Cache
+# 8. The environment: the Tengoku tree — one self-contained library seeded from
+# Mathlib, no Lake dependencies. Its published build cache replaces
+# `lake exe cache get`; `tengoku_sync` (an MCP tool) repeats these three
+# steps at runtime whenever the tree has grown.
+USER root
+RUN apt-get update && apt-get install -y zstd gh && rm -rf /var/lib/apt/lists/*
+USER user
 WORKDIR ${HOME}/app
-
-RUN lake update
-
-# CRITICAL: Fetch pre-compiled Mathlib binaries during the image build.
-# If you skip this, your first FastMCP request will hang for 3 hours compiling math.
-RUN lake exe cache get
-RUN lake build
+RUN git clone --depth 1 https://github.com/competemath/tengoku.git tengoku
+ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
+# gh needs a token to read release assets at build time: pass GH_TOKEN as a build secret.
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN cd tengoku && scripts/cache.sh get
+RUN cd tengoku && lake build
+RUN touch ${HOME}/app/tengoku/virtual_sandbox.lean
 
 # 9. Environment Variables
 EXPOSE 7860

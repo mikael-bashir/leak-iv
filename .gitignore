@@ -5,3 +5,5 @@ venv
 /PyPantograph
 __pycache__/
 *.pyc
+
+.venv/
