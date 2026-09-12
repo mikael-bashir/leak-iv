@@ -248,7 +248,25 @@ class LeanCompilerDaemon:
             # seeded from Mathlib); its root import is injected unless the
             # script already imports from the tree. `import Mathlib` in a
             # legacy script is rewritten to the tree's root.
-            script = re.sub(r"^[ \t]*import[ \t]+Mathlib[ \t]*$", TENGOKU_IMPORTS.split("\n")[0], script, flags=re.M)
+            # Module-level imports of the libraries the tree was seeded from map
+            # onto the tree the same way the seed mapped them (Mathlib.X ->
+            # Tengoku.X, Batteries.X -> Tengoku.Std.X, ...); `import Mathlib`
+            # itself becomes the tree's root import.
+            seed_map = (("Mathlib", "Tengoku"), ("Batteries", "Tengoku.Std"), ("Aesop", "Tengoku.Tactic.Aesop"),
+                        ("Qq", "Tengoku.Meta.Qq"), ("ProofWidgets", "Tengoku.Widgets"), ("Plausible", "Tengoku.Testing.Random"),
+                        ("LeanSearchClient", "Tengoku.Search.LeanSearchClient"), ("ImportGraph", "Tengoku.Meta.ImportGraph"),
+                        ("Cli", "Tengoku.Meta.Cli"))
+
+            def _map_seed_import(m):
+                root, rest = m.group(2), m.group(3)
+                for old, new in seed_map:
+                    if root == old:
+                        if old == "Mathlib" and not rest:
+                            return TENGOKU_IMPORTS.split("\n")[0]
+                        return f"{m.group(1)}{new}{rest}"
+                return m.group(0)
+
+            script = re.sub(r"^([ \t]*import[ \t]+)([A-Za-z_]\w*)((?:\.[\w«»]+)*)[ \t]*$", _map_seed_import, script, flags=re.M)
             full_text = (
                 script if re.search(r"^[ \t]*import[ \t]+Tengoku\b", script, re.M) else f"{TENGOKU_IMPORTS}\n\n{script}"
             ).strip() + "\n\n"
