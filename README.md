@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.png" alt="Leak" width="180"></p>
+
 ---
 title: Leak IV
 emoji: 👀
