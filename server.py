@@ -488,12 +488,14 @@ async def tengoku_sync() -> str:
         # Pin the checkout to the newest published cache's commit: with sources
         # and cache at the same commit `lake build` is a pure replay, nothing
         # compiles. The cache is refreshed regularly, so this lags by little.
+        # Use the freshly fetched cache.sh (not the pinned, older one) to ask.
+        await _run(["git", "checkout", "-q", "origin/main", "--", "scripts/cache.sh"], TENGOKU_DIR, 60)
         rc, out = await _run(["scripts/cache.sh", "latest"], TENGOKU_DIR, 300)
         sha = out.strip().splitlines()[-1] if out.strip() else ""
         steps.append(f"newest cache: rc={rc} {sha[:12]}")
         if rc != 0 or not sha:
             return "❌ tengoku_sync: no published cache\n" + "\n".join(steps) + "\n" + out[-1500:]
-        rc, out = await _run(["git", "checkout", "-q", sha], TENGOKU_DIR, 300)
+        rc, out = await _run(["git", "checkout", "-q", "-f", sha], TENGOKU_DIR, 300)
         steps.append(f"git checkout {sha[:12]}: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
         if rc != 0:
             return "❌ tengoku_sync: checkout failed\n" + "\n".join(steps) + "\n" + out[-1500:]

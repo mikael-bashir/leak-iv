@@ -59,7 +59,11 @@ USER user
 WORKDIR ${HOME}/app
 # Full history without blobs: the cache script picks the newest published
 # cache that is an ancestor of HEAD, which a depth-1 clone cannot answer.
-RUN git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
+# Changing this build arg (the installer passes the current time) invalidates
+# Docker's layer cache from here down, so a re-run re-clones and re-pins to the
+# newest cache instead of reusing a stale clone layer.
+ARG TENGOKU_REFRESH=0
+RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
 ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # gh needs a token to read release assets at build time: pass GH_TOKEN as a build secret.
 # Pin the checkout to the commit of the newest published cache, then fetch
