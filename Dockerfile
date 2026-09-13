@@ -57,11 +57,17 @@ USER root
 RUN apt-get update && apt-get install -y zstd gh && rm -rf /var/lib/apt/lists/*
 USER user
 WORKDIR ${HOME}/app
-RUN git clone --depth 1 https://github.com/competemath/tengoku.git tengoku
+# Full history without blobs: the cache script picks the newest published
+# cache that is an ancestor of HEAD, which a depth-1 clone cannot answer.
+RUN git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
 ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # gh needs a token to read release assets at build time: pass GH_TOKEN as a build secret.
-RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN cd tengoku && scripts/cache.sh get
-RUN cd tengoku && lake build
+# The tree is public: the cache is fetched anonymously (a GH_TOKEN build
+# secret is optional and only raises the API rate limit).
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/cache.sh get
+# Everything the verifier imports (the seeded root plus every trusted library).
+RUN cd tengoku && lake build Tengoku.All
+ENV TENGOKU_IMPORTS="import Tengoku.All"
 RUN touch ${HOME}/app/tengoku/virtual_sandbox.lean
 
 # 9. Environment Variables
