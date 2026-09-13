@@ -469,10 +469,10 @@ async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
 @mcp.tool()
 async def tengoku_sync() -> str:
     """
-    Update this verifier's environment to whatever the Tengoku tree currently
-    is: pull the tree, fetch its newest published build cache
-    (`scripts/cache.sh get`), build whatever the cache doesn't cover, then
-    restart the resident `lake serve` so new modules are importable.
+    Update this verifier's environment to the newest published Tengoku build
+    cache: fetch the tree, check out the cache's commit, unpack the cache
+    (`scripts/cache.sh get`), replay `Tengoku.All` (nothing is compiled), then
+    restart the resident `lake serve` so the refreshed modules are importable.
 
     Serialised with verification (no verify runs mid-sync). Returns the tree's
     new HEAD and what each step did. Idempotent: syncing an already-current
@@ -481,14 +481,28 @@ async def tengoku_sync() -> str:
     async with fast_compiler.lock:
         steps = []
         head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-        rc, out = await _run(["git", "pull", "--ff-only", "origin", "main"], TENGOKU_DIR, 300)
-        steps.append(f"git pull: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
+        rc, out = await _run(["git", "fetch", "origin", "main"], TENGOKU_DIR, 300)
+        steps.append(f"git fetch: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
         if rc != 0:
-            return "❌ tengoku_sync: git pull failed\n" + "\n".join(steps) + "\n" + out[-1500:]
+            return "❌ tengoku_sync: git fetch failed\n" + "\n".join(steps) + "\n" + out[-1500:]
+        # Pin the checkout to the newest published cache's commit: with sources
+        # and cache at the same commit `lake build` is a pure replay, nothing
+        # compiles. The cache is refreshed regularly, so this lags by little.
+        rc, out = await _run(["scripts/cache.sh", "latest"], TENGOKU_DIR, 300)
+        sha = out.strip().splitlines()[-1] if out.strip() else ""
+        steps.append(f"newest cache: rc={rc} {sha[:12]}")
+        if rc != 0 or not sha:
+            return "❌ tengoku_sync: no published cache\n" + "\n".join(steps) + "\n" + out[-1500:]
+        rc, out = await _run(["git", "checkout", "-q", sha], TENGOKU_DIR, 300)
+        steps.append(f"git checkout {sha[:12]}: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
+        if rc != 0:
+            return "❌ tengoku_sync: checkout failed\n" + "\n".join(steps) + "\n" + out[-1500:]
         rc, out = await _run(["scripts/cache.sh", "get"], TENGOKU_DIR, 1800)
         steps.append(f"cache get: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
-        rc, out = await _run(["lake", "build"], TENGOKU_DIR, 3600)
-        steps.append(f"lake build: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
+        if rc != 0:
+            return "❌ tengoku_sync: cache fetch failed\n" + "\n".join(steps) + "\n" + out[-1500:]
+        rc, out = await _run(["lake", "build", "Tengoku.All"], TENGOKU_DIR, 3600)
+        steps.append(f"lake build Tengoku.All (replay): rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
         if rc != 0:
             return "❌ tengoku_sync: the tree does not build here (cache incomplete or stale toolchain?)\n" + "\n".join(steps) + "\n" + out[-2000:]
         head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()

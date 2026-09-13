@@ -62,10 +62,15 @@ WORKDIR ${HOME}/app
 RUN git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
 ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # gh needs a token to read release assets at build time: pass GH_TOKEN as a build secret.
-# The tree is public: the cache is fetched anonymously (a GH_TOKEN build
-# secret is optional and only raises the API rate limit).
-RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/cache.sh get
-# Everything the verifier imports (the seeded root plus every trusted library).
+# Pin the checkout to the commit of the newest published cache, then fetch
+# that cache (anonymously — the tree is public; a GH_TOKEN build secret only
+# raises the API rate limit). With sources and cache at the same commit the
+# build below is a pure replay: nothing is compiled. The cache is refreshed
+# regularly, so this lags the tree by little; `tengoku_sync` moves forward.
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku \
+ && sha="$(scripts/cache.sh latest)" && git checkout -q "$sha" && echo "tree pinned to cache commit $sha" \
+ && scripts/cache.sh get
+# Everything the verifier imports (the seeded root plus every trusted library) — replayed from the cache.
 RUN cd tengoku && lake build Tengoku.All
 ENV TENGOKU_IMPORTS="import Tengoku.All"
 RUN touch ${HOME}/app/tengoku/virtual_sandbox.lean
