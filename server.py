@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
@@ -71,6 +72,11 @@ mcp = FastMCP(
 # How long a single (warm) verify may run before we give up (Lean elaboration
 # for a hard proof can be slow; this is the backstop, not the normal path).
 VERIFY_TIMEOUT = 180.0
+# What every script compiles against: the Tengoku tree's root. Newline-separated
+# import lines; the first one also replaces a legacy `import Mathlib`.
+TENGOKU_IMPORTS = os.environ.get("TENGOKU_IMPORTS", "import Tengoku").strip()
+# The tree checkout the daemon serves (its own lakefile, its own build cache).
+TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
 # The FIRST compile has to load all of Mathlib into the elaborator. On a small
 # shared CPU (e.g. HF cpu-basic) that cold load can take several minutes, so the
 # one-off warmup gets a much larger ceiling. If this is too small, the warmup
@@ -238,8 +244,31 @@ class LeanCompilerDaemon:
 
             self.version += 1
             ver = self.version
+            # The environment is the Tengoku tree (one self-contained library
+            # seeded from Mathlib); its root import is injected unless the
+            # script already imports from the tree. `import Mathlib` in a
+            # legacy script is rewritten to the tree's root.
+            # Module-level imports of the libraries the tree was seeded from map
+            # onto the tree the same way the seed mapped them (Mathlib.X ->
+            # Tengoku.X, Batteries.X -> Tengoku.Std.X, ...); `import Mathlib`
+            # itself becomes the tree's root import.
+            seed_map = (("Mathlib", "Tengoku"), ("Batteries", "Tengoku.Std"), ("Aesop", "Tengoku.Tactic.Aesop"),
+                        ("Qq", "Tengoku.Meta.Qq"), ("ProofWidgets", "Tengoku.Widgets"), ("Plausible", "Tengoku.Testing.Random"),
+                        ("LeanSearchClient", "Tengoku.Search.LeanSearchClient"), ("ImportGraph", "Tengoku.Meta.ImportGraph"),
+                        ("Cli", "Tengoku.Meta.Cli"))
+
+            def _map_seed_import(m):
+                root, rest = m.group(2), m.group(3)
+                for old, new in seed_map:
+                    if root == old:
+                        if old == "Mathlib" and not rest:
+                            return TENGOKU_IMPORTS.split("\n")[0]
+                        return f"{m.group(1)}{new}{rest}"
+                return m.group(0)
+
+            script = re.sub(r"^([ \t]*import[ \t]+)([A-Za-z_]\w*)((?:\.[\w«»]+)*)[ \t]*$", _map_seed_import, script, flags=re.M)
             full_text = (
-                script if "import Mathlib" in script else f"import Mathlib\n\n{script}"
+                script if re.search(r"^[ \t]*import[ \t]+Tengoku\b", script, re.M) else f"{TENGOKU_IMPORTS}\n\n{script}"
             ).strip() + "\n\n"
 
             preview = " ".join(script.strip().split())[:200]
@@ -405,12 +434,15 @@ async def verify_full_script(script: str) -> str:
     and NO warnings (a `sorry`/`admit` is a warning and therefore fails). On any
     problem it returns "❌ Compilation Failed:" followed by each Line/severity/message.
 
-    IMPORTANT: "import Mathlib" is injected for you — do not add imports, and
-    assume only Mathlib is available.
+    IMPORTANT: the Tengoku tree's root import is injected for you — do not add
+    imports (a legacy `import Mathlib` line is rewritten to the tree's root),
+    and assume exactly what the tree contains is available: everything it was
+    seeded with (Mathlib and what Mathlib pulled in) plus every verified
+    addition since (`Tengoku.<Library>.*`).
 
     On success the return also ends with a machine-parseable marker
     `[[LEAK_NORMALIZED_SCRIPT_B64:<base64>]]` carrying the EXACT text that was
-    compiled (your script with "import Mathlib" injected if it was missing).
+    compiled (your script with the tree import injected if it was missing).
     A caller that persists "the proof" should decode and store this instead of
     its own `script` argument, so the saved artifact is self-contained and
     doesn't silently depend on this daemon's injection to compile standalone.
@@ -423,16 +455,134 @@ async def verify_full_script(script: str) -> str:
         return f"❌ Unexpected server error during verification:\n{err}"
 
 
+async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return -1, f"timed out after {timeout:.0f}s: {' '.join(cmd)}"
+    return proc.returncode, out.decode("utf-8", errors="replace")
+
+
+# --- Tree refresh -------------------------------------------------------------
+# One implementation behind three doors: the `tengoku_sync` MCP tool, the
+# POST /refresh endpoint the nightly cache workflow calls, and the check at
+# start-up. `scripts/pin.sh` (in the tree) does the git/cache/replay work;
+# here we only serialise it with verification and restart the elaborator.
+_refresh = {"running": False, "last_post": 0.0, "last": ""}
+# TENGOKU_AUTO_REFRESH=0 turns every door off: for an instance that runs on a
+# developer's working tree (which must never be checked out or overwritten).
+AUTO_REFRESH = os.environ.get("TENGOKU_AUTO_REFRESH", "1") != "0"
+
+
+async def _tree_check() -> tuple[str, str]:
+    """('current' | 'newer' | 'unknown', sha-or-detail) — changes nothing."""
+    rc, out = await _run(["scripts/pin.sh", "--check"], TENGOKU_DIR, 300)
+    last = out.strip().splitlines()[-1] if out.strip() else ""
+    parts = last.split()
+    if rc in (0, 3) and len(parts) == 2 and parts[0] in ("current", "newer"):
+        return parts[0], parts[1]
+    return "unknown", last[:200]
+
+
+async def _tengoku_sync() -> str:
+    if _refresh["running"]:
+        return "⏳ tengoku_sync: a refresh is already running"
+    _refresh["running"] = True
+    try:
+        async with fast_compiler.lock:
+            head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+            rc, out = await _run(["scripts/pin.sh"], TENGOKU_DIR, 3600)
+            tail = out.strip().splitlines()[-1] if out.strip() else ""
+            if rc != 0:
+                _refresh["last"] = f"failed: {tail}"
+                return "❌ tengoku_sync: could not pin the tree to the newest cache\n" + out[-2000:]
+            head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+            # Restart the resident elaborator so the refreshed oleans are what
+            # every following verify imports.
+            if fast_compiler.process and fast_compiler.process.returncode is None:
+                fast_compiler.process.kill()
+                await fast_compiler.process.wait()
+            fast_compiler.process = None
+            fast_compiler._is_file_open = False
+        await fast_compiler.boot()
+        asyncio.create_task(_warmup())
+        _refresh["last"] = f"{head_before} → {head_after}"
+        return f"✅ tengoku_sync: tree {head_before} → {head_after} ({tail}); elaborator restarted, warming."
+    finally:
+        _refresh["running"] = False
+
+
+@mcp.tool()
+async def tengoku_sync() -> str:
+    """
+    Move this verifier onto the newest published Tengoku build cache: pin the
+    tree to that cache's commit, unpack it, replay `Tengoku.All` (nothing is
+    compiled) and restart the resident elaborator. Serialised with
+    verification. A tree already at the newest cache is a no-op apart from the
+    restart.
+    """
+    if not AUTO_REFRESH:
+        return "⛔ tengoku_sync is disabled on this instance (TENGOKU_AUTO_REFRESH=0: it runs on a working tree)."
+    return await _tengoku_sync()
+
+
+async def _refresh_endpoint(request):
+    """GET: is a newer cache published than the one loaded? POST: if so, refresh
+    in the background. Public on purpose: it can only ever move the tree to a
+    cache competemath/tengoku has PUBLISHED, so the most a stranger can do is
+    make this server look at GitHub once every five minutes."""
+    from starlette.responses import JSONResponse
+    head = (await _run(["git", "rev-parse", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+    if request.method == "GET":
+        status, sha = await _tree_check()
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "last": _refresh["last"]})
+    if not AUTO_REFRESH:
+        return JSONResponse({"status": "disabled", "pinned": head}, status_code=403)
+    if _refresh["running"]:
+        return JSONResponse({"status": "busy", "pinned": head}, status_code=409)
+    now = time.time()
+    if now - _refresh["last_post"] < 300:
+        return JSONResponse({"status": "cooldown", "pinned": head}, status_code=429)
+    _refresh["last_post"] = now
+    status, sha = await _tree_check()
+    if status != "newer":
+        return JSONResponse({"status": status, "pinned": head, "newest": sha})
+    asyncio.create_task(_tengoku_sync())
+    return JSONResponse({"status": "refreshing", "pinned": head, "newest": sha}, status_code=202)
+
+
+async def _startup():
+    """At start: if a newer cache was published since this image was built (a
+    nightly went by while the Space slept), move onto it before warming up."""
+    if not AUTO_REFRESH:
+        logger.info("🌳 Tree auto-refresh is off (TENGOKU_AUTO_REFRESH=0)")
+        await _warmup()
+        return
+    status, sha = await _tree_check()
+    if status == "newer":
+        logger.info(f"🌱 A newer Tengoku cache is published ({sha[:12]}) — refreshing before warm-up…")
+        result = await _tengoku_sync()
+        logger.info(result.splitlines()[0])
+        if result.startswith("✅"):
+            return  # _tengoku_sync booted the elaborator and started the warm-up
+    else:
+        logger.info(f"🌳 Tree check: {status} {sha[:12]}")
+    await _warmup()
+
+
 # =============================================================================
 # BOOT
 # =============================================================================
 async def _warmup():
-    logger.info("⏳ Warmup: cold-loading Mathlib into the elaborator "
+    logger.info("⏳ Warmup: cold-loading the Tengoku tree into the elaborator "
                 "(first load can take several minutes on a small CPU)…")
     try:
         r = await fast_compiler.verify_script(
             "theorem warmup : 1 + 1 = 2 := by rfl", timeout=WARMUP_TIMEOUT)
-        logger.info(f"✅ Warmup complete — Mathlib resident. Result: {r}")
+        logger.info(f"✅ Warmup complete — Tengoku resident. Result: {r}")
     except Exception as e:
         logger.error(f"⚠️  Warmup did not finish: {e}")
 
@@ -449,9 +599,10 @@ async def main_serve():
     #  2. The daemon lock serialises verifies, so the first real request simply
     #     WAITS behind this warmup instead of firing its own didChange and
     #     restarting the load — the thrash that kept Mathlib from ever loading.
-    asyncio.create_task(_warmup())
+    asyncio.create_task(_startup())
 
     http_app = mcp.sse_app()
+    http_app.add_route("/refresh", _refresh_endpoint, methods=["GET", "POST"])
     http_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -460,9 +611,10 @@ async def main_serve():
         expose_headers=["mcp-session-id"],
     )
 
-    logger.info("🌐 Serving MCP (SSE) on 0.0.0.0:7860")
+    port = int(os.environ.get("PORT", "7860"))
+    logger.info(f"🌐 Serving MCP (SSE) on 0.0.0.0:{port}")
     config = uvicorn.Config(
-        http_app, host="0.0.0.0", port=7860,
+        http_app, host="0.0.0.0", port=port,
         proxy_headers=True, forwarded_allow_ips="*",
         log_level="info", loop="asyncio",
     )

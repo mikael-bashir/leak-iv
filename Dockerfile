@@ -49,15 +49,34 @@ RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 # Dockerfile, and every day it stayed was a toolchain-upgrade risk this
 # service never actually needed to carry. Removed.
 
-# 8. Setup Lean Mathlib Cache
+# 8. The environment: the Tengoku tree — one self-contained library seeded from
+# Mathlib, no Lake dependencies. Its published build cache replaces
+# `lake exe cache get`; `tengoku_sync` (an MCP tool) repeats these three
+# steps at runtime whenever the tree has grown.
+USER root
+RUN apt-get update && apt-get install -y zstd && rm -rf /var/lib/apt/lists/*
+USER user
 WORKDIR ${HOME}/app
-
-RUN lake update
-
-# CRITICAL: Fetch pre-compiled Mathlib binaries during the image build.
-# If you skip this, your first FastMCP request will hang for 3 hours compiling math.
-RUN lake exe cache get
-RUN lake build
+# Full history without blobs: the cache script picks the newest published
+# cache that is an ancestor of HEAD, which a depth-1 clone cannot answer.
+# Changing this build arg (the installer passes the current time) invalidates
+# Docker's layer cache from here down, so a re-run re-clones and re-pins to the
+# newest cache instead of reusing a stale clone layer.
+ARG TENGOKU_REFRESH=0
+RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
+ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
+# gh needs a token to read release assets at build time: pass GH_TOKEN as a build secret.
+# Pin the checkout to the commit of the newest published cache, then fetch
+# that cache (anonymously — the tree is public; a GH_TOKEN build secret only
+# raises the API rate limit). With sources and cache at the same commit the
+# build below is a pure replay: nothing is compiled. The cache is refreshed
+# regularly, so this lags the tree by little; `tengoku_sync` moves forward.
+# Pin the tree to its newest published cache and replay it: nothing compiles.
+# The same script runs at container start (so a nightly cache published while
+# a Space slept is picked up then) and behind tengoku_sync / POST /refresh.
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh
+ENV TENGOKU_IMPORTS="import Tengoku.All"
+RUN touch ${HOME}/app/tengoku/virtual_sandbox.lean
 
 # 9. Environment Variables
 EXPOSE 7860
