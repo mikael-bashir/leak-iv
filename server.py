@@ -466,70 +466,112 @@ async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
     return proc.returncode, out.decode("utf-8", errors="replace")
 
 
+# --- Tree refresh -------------------------------------------------------------
+# One implementation behind three doors: the `tengoku_sync` MCP tool, the
+# POST /refresh endpoint the nightly cache workflow calls, and the check at
+# start-up. `scripts/pin.sh` (in the tree) does the git/cache/replay work;
+# here we only serialise it with verification and restart the elaborator.
+_refresh = {"running": False, "last_post": 0.0, "last": ""}
+
+
+async def _tree_check() -> tuple[str, str]:
+    """('current' | 'newer' | 'unknown', sha-or-detail) — changes nothing."""
+    rc, out = await _run(["scripts/pin.sh", "--check"], TENGOKU_DIR, 300)
+    last = out.strip().splitlines()[-1] if out.strip() else ""
+    parts = last.split()
+    if rc in (0, 3) and len(parts) == 2 and parts[0] in ("current", "newer"):
+        return parts[0], parts[1]
+    return "unknown", last[:200]
+
+
+async def _tengoku_sync() -> str:
+    if _refresh["running"]:
+        return "⏳ tengoku_sync: a refresh is already running"
+    _refresh["running"] = True
+    try:
+        async with fast_compiler.lock:
+            head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+            rc, out = await _run(["scripts/pin.sh"], TENGOKU_DIR, 3600)
+            tail = out.strip().splitlines()[-1] if out.strip() else ""
+            if rc != 0:
+                _refresh["last"] = f"failed: {tail}"
+                return "❌ tengoku_sync: could not pin the tree to the newest cache\n" + out[-2000:]
+            head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+            # Restart the resident elaborator so the refreshed oleans are what
+            # every following verify imports.
+            if fast_compiler.process and fast_compiler.process.returncode is None:
+                fast_compiler.process.kill()
+                await fast_compiler.process.wait()
+            fast_compiler.process = None
+            fast_compiler._is_file_open = False
+        await fast_compiler.boot()
+        asyncio.create_task(_warmup())
+        _refresh["last"] = f"{head_before} → {head_after}"
+        return f"✅ tengoku_sync: tree {head_before} → {head_after} ({tail}); elaborator restarted, warming."
+    finally:
+        _refresh["running"] = False
+
+
 @mcp.tool()
 async def tengoku_sync() -> str:
     """
-    Update this verifier's environment to the newest published Tengoku build
-    cache: fetch the tree, check out the cache's commit, unpack the cache
-    (`scripts/cache.sh get`), replay `Tengoku.All` (nothing is compiled), then
-    restart the resident `lake serve` so the refreshed modules are importable.
-
-    Serialised with verification (no verify runs mid-sync). Returns the tree's
-    new HEAD and what each step did. Idempotent: syncing an already-current
-    tree is a no-op apart from the restart.
+    Move this verifier onto the newest published Tengoku build cache: pin the
+    tree to that cache's commit, unpack it, replay `Tengoku.All` (nothing is
+    compiled) and restart the resident elaborator. Serialised with
+    verification. A tree already at the newest cache is a no-op apart from the
+    restart.
     """
-    async with fast_compiler.lock:
-        steps = []
-        head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-        rc, out = await _run(["git", "fetch", "origin", "main"], TENGOKU_DIR, 300)
-        steps.append(f"git fetch: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
-        if rc != 0:
-            return "❌ tengoku_sync: git fetch failed\n" + "\n".join(steps) + "\n" + out[-1500:]
-        # Pin the checkout to the newest published cache's commit: with sources
-        # and cache at the same commit `lake build` is a pure replay, nothing
-        # compiles. The cache is refreshed regularly, so this lags by little.
-        # Use the freshly fetched cache.sh (not the pinned, older one) to ask.
-        await _run(["git", "checkout", "-q", "origin/main", "--", "scripts/cache.sh"], TENGOKU_DIR, 60)
-        rc, out = await _run(["scripts/cache.sh", "latest"], TENGOKU_DIR, 300)
-        sha = out.strip().splitlines()[-1] if out.strip() else ""
-        steps.append(f"newest cache: rc={rc} {sha[:12]}")
-        if rc != 0 or not sha:
-            return "❌ tengoku_sync: no published cache\n" + "\n".join(steps) + "\n" + out[-1500:]
-        rc, out = await _run(["git", "checkout", "-q", "-f", sha], TENGOKU_DIR, 300)
-        steps.append(f"git checkout {sha[:12]}: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
-        if rc != 0:
-            return "❌ tengoku_sync: checkout failed\n" + "\n".join(steps) + "\n" + out[-1500:]
-        rc, out = await _run(["scripts/cache.sh", "get"], TENGOKU_DIR, 1800)
-        steps.append(f"cache get: rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
-        if rc != 0:
-            return "❌ tengoku_sync: cache fetch failed\n" + "\n".join(steps) + "\n" + out[-1500:]
-        rc, out = await _run(["lake", "build", "Tengoku.All"], TENGOKU_DIR, 3600)
-        steps.append(f"lake build Tengoku.All (replay): rc={rc} {out.strip().splitlines()[-1] if out.strip() else ''}")
-        if rc != 0:
-            return "❌ tengoku_sync: the tree does not build here (cache incomplete or stale toolchain?)\n" + "\n".join(steps) + "\n" + out[-2000:]
-        head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-        # Restart the resident elaborator so the refreshed oleans are what
-        # every following verify imports.
-        if fast_compiler.process and fast_compiler.process.returncode is None:
-            fast_compiler.process.kill()
-            await fast_compiler.process.wait()
-        fast_compiler.process = None
-        fast_compiler._is_file_open = False
-    await fast_compiler.boot()
-    asyncio.create_task(_warmup())
-    return f"✅ tengoku_sync: tree {head_before} → {head_after}; elaborator restarted, warming.\n" + "\n".join(steps)
+    return await _tengoku_sync()
+
+
+async def _refresh_endpoint(request):
+    """GET: is a newer cache published than the one loaded? POST: if so, refresh
+    in the background. Public on purpose: it can only ever move the tree to a
+    cache competemath/tengoku has PUBLISHED, so the most a stranger can do is
+    make this server look at GitHub once every five minutes."""
+    from starlette.responses import JSONResponse
+    head = (await _run(["git", "rev-parse", "HEAD"], TENGOKU_DIR, 30))[1].strip()
+    if request.method == "GET":
+        status, sha = await _tree_check()
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "last": _refresh["last"]})
+    if _refresh["running"]:
+        return JSONResponse({"status": "busy", "pinned": head}, status_code=409)
+    now = time.time()
+    if now - _refresh["last_post"] < 300:
+        return JSONResponse({"status": "cooldown", "pinned": head}, status_code=429)
+    _refresh["last_post"] = now
+    status, sha = await _tree_check()
+    if status != "newer":
+        return JSONResponse({"status": status, "pinned": head, "newest": sha})
+    asyncio.create_task(_tengoku_sync())
+    return JSONResponse({"status": "refreshing", "pinned": head, "newest": sha}, status_code=202)
+
+
+async def _startup():
+    """At start: if a newer cache was published since this image was built (a
+    nightly went by while the Space slept), move onto it before warming up."""
+    status, sha = await _tree_check()
+    if status == "newer":
+        logger.info(f"🌱 A newer Tengoku cache is published ({sha[:12]}) — refreshing before warm-up…")
+        result = await _tengoku_sync()
+        logger.info(result.splitlines()[0])
+        if result.startswith("✅"):
+            return  # _tengoku_sync booted the elaborator and started the warm-up
+    else:
+        logger.info(f"🌳 Tree check: {status} {sha[:12]}")
+    await _warmup()
 
 
 # =============================================================================
 # BOOT
 # =============================================================================
 async def _warmup():
-    logger.info("⏳ Warmup: cold-loading Mathlib into the elaborator "
+    logger.info("⏳ Warmup: cold-loading the Tengoku tree into the elaborator "
                 "(first load can take several minutes on a small CPU)…")
     try:
         r = await fast_compiler.verify_script(
             "theorem warmup : 1 + 1 = 2 := by rfl", timeout=WARMUP_TIMEOUT)
-        logger.info(f"✅ Warmup complete — Mathlib resident. Result: {r}")
+        logger.info(f"✅ Warmup complete — Tengoku resident. Result: {r}")
     except Exception as e:
         logger.error(f"⚠️  Warmup did not finish: {e}")
 
@@ -546,9 +588,10 @@ async def main_serve():
     #  2. The daemon lock serialises verifies, so the first real request simply
     #     WAITS behind this warmup instead of firing its own didChange and
     #     restarting the load — the thrash that kept Mathlib from ever loading.
-    asyncio.create_task(_warmup())
+    asyncio.create_task(_startup())
 
     http_app = mcp.sse_app()
+    http_app.add_route("/refresh", _refresh_endpoint, methods=["GET", "POST"])
     http_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
