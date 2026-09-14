@@ -54,7 +54,7 @@ RUN uv pip install fastmcp "mcp<2" asyncio nest_asyncio
 # `lake exe cache get`; `tengoku_sync` (an MCP tool) repeats these three
 # steps at runtime whenever the tree has grown.
 USER root
-RUN apt-get update && apt-get install -y zstd gh && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y zstd && rm -rf /var/lib/apt/lists/*
 USER user
 WORKDIR ${HOME}/app
 # Full history without blobs: the cache script picks the newest published
@@ -71,11 +71,10 @@ ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # raises the API rate limit). With sources and cache at the same commit the
 # build below is a pure replay: nothing is compiled. The cache is refreshed
 # regularly, so this lags the tree by little; `tengoku_sync` moves forward.
-RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku \
- && sha="$(scripts/cache.sh latest)" && git checkout -q "$sha" && echo "tree pinned to cache commit $sha" \
- && scripts/cache.sh get
-# Everything the verifier imports (the seeded root plus every trusted library) — replayed from the cache.
-RUN cd tengoku && lake build Tengoku.All
+# Pin the tree to its newest published cache and replay it: nothing compiles.
+# The same script runs at container start (so a nightly cache published while
+# a Space slept is picked up then) and behind tengoku_sync / POST /refresh.
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh
 ENV TENGOKU_IMPORTS="import Tengoku.All"
 RUN touch ${HOME}/app/tengoku/virtual_sandbox.lean
 
