@@ -475,11 +475,22 @@ _refresh = {"running": False, "last_post": 0.0, "last": ""}
 # TENGOKU_AUTO_REFRESH=0 turns every door off: for an instance that runs on a
 # developer's working tree (which must never be checked out or overwritten).
 AUTO_REFRESH = os.environ.get("TENGOKU_AUTO_REFRESH", "1") != "0"
+PIN_SH = os.path.join(TENGOKU_DIR, "scripts", "pin.sh")
+
+
+async def _ensure_pin() -> None:
+    """A tree pinned to a cache commit that predates scripts/pin.sh has no copy
+    of it: take the newest helper scripts from origin/main first."""
+    if os.path.exists(PIN_SH):
+        return
+    await _run(["git", "fetch", "-q", "origin", "main"], TENGOKU_DIR, 300)
+    await _run(["git", "checkout", "-q", "origin/main", "--", "scripts/pin.sh", "scripts/cache.sh"], TENGOKU_DIR, 60)
 
 
 async def _tree_check() -> tuple[str, str]:
     """('current' | 'newer' | 'unknown', sha-or-detail) — changes nothing."""
-    rc, out = await _run(["scripts/pin.sh", "--check"], TENGOKU_DIR, 300)
+    await _ensure_pin()
+    rc, out = await _run([PIN_SH, "--check"], TENGOKU_DIR, 300)
     last = out.strip().splitlines()[-1] if out.strip() else ""
     parts = last.split()
     if rc in (0, 3) and len(parts) == 2 and parts[0] in ("current", "newer"):
@@ -494,7 +505,8 @@ async def _tengoku_sync() -> str:
     try:
         async with fast_compiler.lock:
             head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-            rc, out = await _run(["scripts/pin.sh"], TENGOKU_DIR, 3600)
+            await _ensure_pin()
+            rc, out = await _run([PIN_SH], TENGOKU_DIR, 3600)
             tail = out.strip().splitlines()[-1] if out.strip() else ""
             if rc != 0:
                 _refresh["last"] = f"failed: {tail}"
@@ -561,7 +573,11 @@ async def _startup():
         logger.info("🌳 Tree auto-refresh is off (TENGOKU_AUTO_REFRESH=0)")
         await _warmup()
         return
-    status, sha = await _tree_check()
+    try:
+        status, sha = await _tree_check()
+    except Exception as e:  # never let the check keep the service from warming up
+        logger.warning(f"tree check failed: {e}")
+        status, sha = "unknown", str(e)[:120]
     if status == "newer":
         logger.info(f"🌱 A newer Tengoku cache is published ({sha[:12]}) — refreshing before warm-up…")
         result = await _tengoku_sync()
