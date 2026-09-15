@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import signal
 import re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -113,12 +114,15 @@ class LeanCompilerDaemon:
         if self.process and self.process.returncode is None:
             return
         logger.info("🚨 [BOOT] starting `lake serve` subprocess...")
+        # Its own process group: `lake serve` forks `lean` workers that hold the
+        # pipes, so a restart must kill the whole group or `wait()` never returns.
         self.process = await asyncio.create_subprocess_exec(
             "lake", "serve",
             cwd=self.project_dir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         asyncio.create_task(self._log_stderr())
         await self._send("initialize", {
@@ -498,10 +502,28 @@ async def _tree_check() -> tuple[str, str]:
     return "unknown", last[:200]
 
 
+async def _stop_elaborator() -> None:
+    """Kill `lake serve` and every `lean` worker it forked, and never wait forever for the exit."""
+    p = fast_compiler.process
+    if p and p.returncode is None:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            p.kill()
+        try:
+            await asyncio.wait_for(p.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("elaborator did not report its exit within 15 s — continuing with a fresh one")
+    fast_compiler.process = None
+    fast_compiler._is_file_open = False
+
+
 async def _tengoku_sync() -> str:
-    if _refresh["running"]:
+    # A refresh that has been "running" for hours is a wedged one: let the next attempt through.
+    if _refresh["running"] and time.time() - _refresh.get("started_at", 0) < 3 * 3600:
         return "⏳ tengoku_sync: a refresh is already running"
     _refresh["running"] = True
+    _refresh["started_at"] = time.time()
     try:
         async with fast_compiler.lock:
             head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
@@ -514,11 +536,7 @@ async def _tengoku_sync() -> str:
             head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
             # Restart the resident elaborator so the refreshed oleans are what
             # every following verify imports.
-            if fast_compiler.process and fast_compiler.process.returncode is None:
-                fast_compiler.process.kill()
-                await fast_compiler.process.wait()
-            fast_compiler.process = None
-            fast_compiler._is_file_open = False
+            await _stop_elaborator()
         await fast_compiler.boot()
         asyncio.create_task(_warmup())
         _refresh["last"] = f"{head_before} → {head_after}"
@@ -553,7 +571,7 @@ async def _refresh_endpoint(request):
         return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "last": _refresh["last"]})
     if not AUTO_REFRESH:
         return JSONResponse({"status": "disabled", "pinned": head}, status_code=403)
-    if _refresh["running"]:
+    if _refresh["running"] and time.time() - _refresh.get("started_at", 0) < 3 * 3600:
         return JSONResponse({"status": "busy", "pinned": head}, status_code=409)
     now = time.time()
     if now - _refresh["last_post"] < 300:
