@@ -72,13 +72,11 @@ ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # build below is a pure replay: nothing is compiled. The cache is refreshed
 # regularly, so this lags the tree by little; `tengoku_sync` moves forward.
 # Pin the tree to its newest published cache and replay it: nothing compiles.
-# The compiled C output (.lake/build/ir, ~6 GB) is not needed to import the
-# tree, so it goes in the same layer that made it — the Space's builder ran out
-# of memory pushing the bigger image.
+# The whole build stays, .lake/build/ir included: `lake serve` checks those
+# artifacts when it sets up a file, and without them it tries to rebuild.
 # The same script runs at container start (so a nightly cache published while
 # a Space slept is picked up then) and behind tengoku_sync / POST /refresh.
-RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh \
- && rm -rf .lake/build/ir
+RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh
 ENV TENGOKU_IMPORTS="import Tengoku.All"
 RUN touch ${HOME}/app/tengoku/virtual_sandbox.lean
 
