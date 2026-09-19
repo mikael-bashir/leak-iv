@@ -618,7 +618,10 @@ async def _refresh_endpoint(request):
     _refresh["last_post"] = now
     status, sha = await _tree_check()
     if status != "newer":
-        return JSONResponse({"status": status, "pinned": head, "newest": sha})
+        # Somebody says the tree moved and we do not see it: the pointer is served through a CDN and
+        # can lag its update by seconds (seen in the soak). Look once more shortly, at no cost.
+        _queue_refresh(75)
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "recheck": "in 75 s"})
     asyncio.create_task(_tengoku_sync())
     return JSONResponse({"status": "refreshing", "pinned": head, "newest": sha}, status_code=202)
 
