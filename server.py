@@ -546,9 +546,12 @@ async def _tengoku_sync() -> str:
                 return "❌ tengoku_sync: could not pin the tree to the newest cache\n" + out[-2000:]
             head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
             # Restart the resident elaborator so the refreshed oleans are what
-            # every following verify imports.
+            # every following verify imports. The new one is started BEFORE the lock is released:
+            # a verification waiting on the lock used to find no elaborator, start its own, and race
+            # this one (two `lake serve` on one set of pipes — a failed verification in the soak,
+            # harmless while refreshes were nightly, not when every merge brings one).
             await _stop_elaborator()
-        await fast_compiler.boot()
+            await fast_compiler.boot()
         asyncio.create_task(_warmup())
         _refresh["count"] += 1
         _refresh["last"] = f"{head_before} → {head_after}"
