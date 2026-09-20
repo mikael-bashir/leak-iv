@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import signal
 import re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -113,12 +114,15 @@ class LeanCompilerDaemon:
         if self.process and self.process.returncode is None:
             return
         logger.info("🚨 [BOOT] starting `lake serve` subprocess...")
+        # Its own process group: `lake serve` forks `lean` workers that hold the
+        # pipes, so a restart must kill the whole group or `wait()` never returns.
         self.process = await asyncio.create_subprocess_exec(
             "lake", "serve",
             cwd=self.project_dir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         asyncio.create_task(self._log_stderr())
         await self._send("initialize", {
@@ -471,15 +475,31 @@ async def _run(cmd: list[str], cwd: str, timeout: float) -> tuple[int, str]:
 # POST /refresh endpoint the nightly cache workflow calls, and the check at
 # start-up. `scripts/pin.sh` (in the tree) does the git/cache/replay work;
 # here we only serialise it with verification and restart the elaborator.
-_refresh = {"running": False, "last_post": 0.0, "last": ""}
+_refresh = {"running": False, "last_post": 0.0, "last": "", "queued": False, "count": 0, "kept": 0}
+# The tree publishes a small "top-up" with every merge (TENGOKU_TOPUPS=1 makes scripts/pin.sh follow
+# them), so refresh requests can arrive every few minutes. They are never dropped: one that arrives
+# while a refresh runs, or sooner than this gap after the last one, is folded into a single deferred
+# refresh — the service always ends on the newest published state, at a bounded rate.
+REFRESH_MIN_GAP = float(os.environ.get("TENGOKU_REFRESH_MIN_GAP", "300"))
 # TENGOKU_AUTO_REFRESH=0 turns every door off: for an instance that runs on a
 # developer's working tree (which must never be checked out or overwritten).
 AUTO_REFRESH = os.environ.get("TENGOKU_AUTO_REFRESH", "1") != "0"
+PIN_SH = os.path.join(TENGOKU_DIR, "scripts", "pin.sh")
+
+
+async def _ensure_pin() -> None:
+    """A tree pinned to a cache commit that predates scripts/pin.sh has no copy
+    of it: take the newest helper scripts from origin/main first."""
+    if os.path.exists(PIN_SH):
+        return
+    await _run(["git", "fetch", "-q", "origin", "main"], TENGOKU_DIR, 300)
+    await _run(["git", "checkout", "-q", "origin/main", "--", "scripts/pin.sh", "scripts/cache.sh"], TENGOKU_DIR, 60)
 
 
 async def _tree_check() -> tuple[str, str]:
     """('current' | 'newer' | 'unknown', sha-or-detail) — changes nothing."""
-    rc, out = await _run(["scripts/pin.sh", "--check"], TENGOKU_DIR, 300)
+    await _ensure_pin()
+    rc, out = await _run([PIN_SH, "--check"], TENGOKU_DIR, 300)
     last = out.strip().splitlines()[-1] if out.strip() else ""
     parts = last.split()
     if rc in (0, 3) and len(parts) == 2 and parts[0] in ("current", "newer"):
@@ -487,28 +507,53 @@ async def _tree_check() -> tuple[str, str]:
     return "unknown", last[:200]
 
 
+async def _stop_elaborator() -> None:
+    """Kill `lake serve` and every `lean` worker it forked, and never wait forever for the exit."""
+    p = fast_compiler.process
+    if p and p.returncode is None:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            p.kill()
+        try:
+            await asyncio.wait_for(p.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("elaborator did not report its exit within 15 s — continuing with a fresh one")
+    fast_compiler.process = None
+    fast_compiler._is_file_open = False
+
+
 async def _tengoku_sync() -> str:
-    if _refresh["running"]:
+    # A refresh that has been "running" for hours is a wedged one: let the next attempt through.
+    if _refresh["running"] and time.time() - _refresh.get("started_at", 0) < 3 * 3600:
         return "⏳ tengoku_sync: a refresh is already running"
     _refresh["running"] = True
+    _refresh["started_at"] = time.time()
     try:
         async with fast_compiler.lock:
             head_before = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
-            rc, out = await _run(["scripts/pin.sh"], TENGOKU_DIR, 3600)
+            await _ensure_pin()
+            rc, out = await _run([PIN_SH], TENGOKU_DIR, 3600)
             tail = out.strip().splitlines()[-1] if out.strip() else ""
+            if rc == 4:
+                # pin.sh could not replay the newest state and put back the one we were serving:
+                # nothing on disk changed, so the resident elaborator stays exactly as it is.
+                _refresh["kept"] += 1
+                _refresh["last"] = f"kept {head_before}: {tail}"
+                return f"↩️ tengoku_sync: {tail} — still serving {head_before}, elaborator untouched."
             if rc != 0:
                 _refresh["last"] = f"failed: {tail}"
                 return "❌ tengoku_sync: could not pin the tree to the newest cache\n" + out[-2000:]
             head_after = (await _run(["git", "rev-parse", "--short", "HEAD"], TENGOKU_DIR, 30))[1].strip()
             # Restart the resident elaborator so the refreshed oleans are what
-            # every following verify imports.
-            if fast_compiler.process and fast_compiler.process.returncode is None:
-                fast_compiler.process.kill()
-                await fast_compiler.process.wait()
-            fast_compiler.process = None
-            fast_compiler._is_file_open = False
-        await fast_compiler.boot()
+            # every following verify imports. The new one is started BEFORE the lock is released:
+            # a verification waiting on the lock used to find no elaborator, start its own, and race
+            # this one (two `lake serve` on one set of pipes — a failed verification in the soak,
+            # harmless while refreshes were nightly, not when every merge brings one).
+            await _stop_elaborator()
+            await fast_compiler.boot()
         asyncio.create_task(_warmup())
+        _refresh["count"] += 1
         _refresh["last"] = f"{head_before} → {head_after}"
         return f"✅ tengoku_sync: tree {head_before} → {head_after} ({tail}); elaborator restarted, warming."
     finally:
@@ -529,6 +574,30 @@ async def tengoku_sync() -> str:
     return await _tengoku_sync()
 
 
+async def _refresh_later(delay: float) -> None:
+    """The one deferred refresh that stands in for every request folded into it."""
+    await asyncio.sleep(delay)
+    _refresh["queued"] = False
+    if _refresh["running"] and time.time() - _refresh.get("started_at", 0) < 3 * 3600:
+        _queue_refresh(30)  # still busy: look again shortly
+        return
+    try:
+        _refresh["last_post"] = time.time()
+        status, _ = await _tree_check()
+        if status == "newer":
+            await _tengoku_sync()
+    except Exception as e:
+        logger.warning(f"deferred refresh failed: {e}")
+
+
+def _queue_refresh(delay: float) -> bool:
+    if _refresh["queued"]:
+        return False
+    _refresh["queued"] = True
+    asyncio.create_task(_refresh_later(max(5.0, delay)))
+    return True
+
+
 async def _refresh_endpoint(request):
     """GET: is a newer cache published than the one loaded? POST: if so, refresh
     in the background. Public on purpose: it can only ever move the tree to a
@@ -538,18 +607,24 @@ async def _refresh_endpoint(request):
     head = (await _run(["git", "rev-parse", "HEAD"], TENGOKU_DIR, 30))[1].strip()
     if request.method == "GET":
         status, sha = await _tree_check()
-        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "last": _refresh["last"]})
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "refreshing": _refresh["running"], "queued": _refresh["queued"],
+                             "last": _refresh["last"], "refreshes": _refresh["count"], "kept": _refresh["kept"], "topups": os.environ.get("TENGOKU_TOPUPS", "0")})
     if not AUTO_REFRESH:
         return JSONResponse({"status": "disabled", "pinned": head}, status_code=403)
-    if _refresh["running"]:
-        return JSONResponse({"status": "busy", "pinned": head}, status_code=409)
     now = time.time()
-    if now - _refresh["last_post"] < 300:
-        return JSONResponse({"status": "cooldown", "pinned": head}, status_code=429)
+    if _refresh["running"] and now - _refresh.get("started_at", 0) < 3 * 3600:
+        _queue_refresh(30)
+        return JSONResponse({"status": "queued", "why": "a refresh is running", "pinned": head}, status_code=202)
+    if now - _refresh["last_post"] < REFRESH_MIN_GAP:
+        _queue_refresh(REFRESH_MIN_GAP - (now - _refresh["last_post"]))
+        return JSONResponse({"status": "queued", "why": "inside the minimum gap", "pinned": head}, status_code=202)
     _refresh["last_post"] = now
     status, sha = await _tree_check()
     if status != "newer":
-        return JSONResponse({"status": status, "pinned": head, "newest": sha})
+        # Somebody says the tree moved and we do not see it: the pointer is served through a CDN and
+        # can lag its update by seconds (seen in the soak). Look once more shortly, at no cost.
+        _queue_refresh(75)
+        return JSONResponse({"status": status, "pinned": head, "newest": sha, "recheck": "in 75 s"})
     asyncio.create_task(_tengoku_sync())
     return JSONResponse({"status": "refreshing", "pinned": head, "newest": sha}, status_code=202)
 
@@ -561,7 +636,11 @@ async def _startup():
         logger.info("🌳 Tree auto-refresh is off (TENGOKU_AUTO_REFRESH=0)")
         await _warmup()
         return
-    status, sha = await _tree_check()
+    try:
+        status, sha = await _tree_check()
+    except Exception as e:  # never let the check keep the service from warming up
+        logger.warning(f"tree check failed: {e}")
+        status, sha = "unknown", str(e)[:120]
     if status == "newer":
         logger.info(f"🌱 A newer Tengoku cache is published ({sha[:12]}) — refreshing before warm-up…")
         result = await _tengoku_sync()

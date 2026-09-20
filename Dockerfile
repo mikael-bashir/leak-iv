@@ -63,7 +63,14 @@ WORKDIR ${HOME}/app
 # Docker's layer cache from here down, so a re-run re-clones and re-pins to the
 # newest cache instead of reusing a stale clone layer.
 ARG TENGOKU_REFRESH=0
-RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/competemath/tengoku.git tengoku
+# Which tree this service follows, and whether it follows the per-merge top-ups (1) or only the
+# nightly cache (0). Both are Space VARIABLES: Hugging Face passes them in as build args and as
+# runtime env, so moving the service to another tree is a variable change plus a factory rebuild.
+ARG TENGOKU_REPO=competemath/tengoku
+ARG TENGOKU_TOPUPS=1
+ENV TENGOKU_REPO=${TENGOKU_REPO}
+ENV TENGOKU_TOPUPS=${TENGOKU_TOPUPS}
+RUN echo "refresh ${TENGOKU_REFRESH}" >/dev/null && git clone --filter=blob:none https://github.com/${TENGOKU_REPO}.git tengoku
 ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # gh needs a token to read release assets at build time: pass GH_TOKEN as a build secret.
 # Pin the checkout to the commit of the newest published cache, then fetch
@@ -72,6 +79,8 @@ ENV LEAN_PROJECT_PATH=${HOME}/app/tengoku
 # build below is a pure replay: nothing is compiled. The cache is refreshed
 # regularly, so this lags the tree by little; `tengoku_sync` moves forward.
 # Pin the tree to its newest published cache and replay it: nothing compiles.
+# The whole build stays, .lake/build/ir included: `lake serve` checks those
+# artifacts when it sets up a file, and without them it tries to rebuild.
 # The same script runs at container start (so a nightly cache published while
 # a Space slept is picked up then) and behind tengoku_sync / POST /refresh.
 RUN --mount=type=secret,id=GH_TOKEN,env=GH_TOKEN,required=false cd tengoku && scripts/pin.sh
