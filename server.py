@@ -85,6 +85,33 @@ TENGOKU_DIR = os.environ.get("LEAN_PROJECT_PATH", ".")
 WARMUP_TIMEOUT = 1200.0
 
 
+AXIOM_CHECK = """
+-- Jinshi/Leak axiom-closure gate (2026-10): a clean LSP compile only means
+-- "no error/warning diagnostic", and Lean does not warn on a freshly
+-- declared `axiom` the way it warns on `sorry` -- so `axiom cheat : False`
+-- followed by `cheat.elim` compiled clean and was reported 100% verified for
+-- ANY target statement. This block runs after the user's script and checks
+-- what the finished environment actually rests on: only the three standard
+-- Mathlib/Lean axioms (propext, Classical.choice, Quot.sound) and the two
+-- native_decide oracle axioms (Lean.ofReduceBool, Lean.trustCompiler) are
+-- permitted. Anything else is a `throwError`, which surfaces as an ordinary
+-- severity-1 diagnostic -- the existing `bad` filter below already treats
+-- that as a failed verification, so no other code path changes.
+open Lean Elab Command in
+run_cmd do
+  let env <- getEnv
+  let allowed : List Name :=
+    [`propext, `Classical.choice, `Quot.sound, `Lean.ofReduceBool, `Lean.trustCompiler]
+  let rogue := env.constants.toList.filterMap fun (n, ci) =>
+    match ci with
+    | .axiomInfo _ => if allowed.contains n then none else some n
+    | _ => none
+  if !rogue.isEmpty then
+    throwError "rogue axiom(s) introduced by this script (outside the standard Mathlib/Lean \
+trust set and the native_decide oracle): {rogue}"
+"""
+
+
 class LeanCompilerDaemon:
     """One long-lived `lake serve` LSP subprocess, driven over stdio."""
 
@@ -270,6 +297,10 @@ class LeanCompilerDaemon:
             full_text = (
                 script if re.search(r"^[ \t]*import[ \t]+Tengoku\b", script, re.M) else f"{TENGOKU_IMPORTS}\n\n{script}"
             ).strip() + "\n\n"
+            # what is actually SENT to the LSP: the user's script plus the axiom-closure
+            # gate. `full_text` itself (without the gate) is still what gets persisted as
+            # the certificate on success -- see the base64 marker below.
+            compiled_text = full_text + AXIOM_CHECK.strip() + "\n\n"
 
             preview = " ".join(script.strip().split())[:200]
             logger.info("─" * 60)
@@ -283,12 +314,12 @@ class LeanCompilerDaemon:
                 if not self._is_file_open:
                     await self._send("textDocument/didOpen", {"textDocument": {
                         "uri": self.uri, "languageId": "lean",
-                        "version": ver, "text": full_text}})
+                        "version": ver, "text": compiled_text}})
                     self._is_file_open = True
                 else:
                     await self._send("textDocument/didChange", {
                         "textDocument": {"uri": self.uri, "version": ver},
-                        "contentChanges": [{"text": full_text}]})
+                        "contentChanges": [{"text": compiled_text}]})
 
                 # Lean's synchronisation primitive: this request only gets a
                 # response once ALL diagnostics for `ver` have been emitted.
