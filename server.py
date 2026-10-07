@@ -102,7 +102,18 @@ open Lean Elab Command in
 run_cmd do
   let env <- getEnv
   let allowed : List Name :=
-    [`propext, `Classical.choice, `Quot.sound, `Lean.ofReduceBool, `Lean.trustCompiler]
+    -- the first five are the standard Mathlib/Lean trust set and the native_decide oracle;
+    -- the rest are compiler-internal markers (erasure/proof-irrelevance/unreachable-code
+    -- stand-ins, `sorryAx` itself, the Nat-reducing native oracle) that Lean declares as
+    -- axioms in EVERY environment regardless of what a script does -- confirmed empirically
+    -- against this exact toolchain + Tengoku import on 2026-10-07 (the first deployment of
+    -- this gate rejected `n + 0 = n := by simp`, a completely ordinary proof, over exactly
+    -- these always-present names; `sorryAx` being merely DECLARED is harmless -- actual
+    -- `sorry` use is independently caught by the severity-2 diagnostic this daemon already
+    -- treats as a failure, a different and unrelated mechanism from this axiom-closure gate).
+    [`propext, `Classical.choice, `Quot.sound, `Lean.ofReduceBool, `Lean.trustCompiler,
+     `Lean.ofReduceNat, `sorryAx, `lcAny, `lcProof, `lcErased, `lcCast, `lcVoid,
+     `lcUnreachable, `Quot.lcInv, `isScalarObj]
   let rogue := env.constants.toList.filterMap fun (n, ci) =>
     match ci with
     | .axiomInfo _ => if allowed.contains n then none else some n
